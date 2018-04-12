@@ -1008,7 +1008,7 @@ struct Thread_t
         rmtThread* thread = (rmtThread*)lpParameter;
         assert(thread != NULL);
         thread->error = thread->callback(thread);
-        return thread->error == RMT_ERROR_NONE ? 1 : 0;
+        return thread->error == RMT_ERROR_NONE ? 0 : 1;
     }
 
 #else
@@ -1770,7 +1770,7 @@ static rmtError Buffer_Grow(Buffer* buffer, rmtU32 length)
 }
 
 
-static rmtError Buffer_Write(Buffer* buffer, void* data, rmtU32 length)
+static rmtError Buffer_Write(Buffer* buffer, const void* data, rmtU32 length)
 {
     assert(buffer != NULL);
 
@@ -2244,11 +2244,10 @@ static void TCPSocket_Destructor(TCPSocket* tcp_socket)
 }
 
 
-static rmtError TCPSocket_RunServer(TCPSocket* tcp_socket, rmtU16 port, rmtBool limit_connections_to_localhost)
+static rmtError TCPSocket_RunServer(TCPSocket* tcp_socket, rmtU16 port, rmtBool reuse_open_port, rmtBool limit_connections_to_localhost)
 {
     SOCKET s = INVALID_SOCKET;
     struct sockaddr_in sin;
-    int enable = 1;
     #ifdef RMT_PLATFORM_WINDOWS
         u_long nonblock = 1;
     #endif
@@ -2261,19 +2260,24 @@ static rmtError TCPSocket_RunServer(TCPSocket* tcp_socket, rmtU16 port, rmtBool 
     if (s == SOCKET_ERROR)
         return RMT_ERROR_SOCKET_CREATE_FAIL;
 
-    // set SO_REUSEADDR so binding doesn't fail when restarting the application
-    // (otherwise the same port can't be reused within TIME_WAIT)
-    // I'm not checking for errors because if this fails (unlikely) we might still
-    // be able to bind to the socket anyway
-    #ifdef RMT_PLATFORM_POSIX
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
-    #elif defined(RMT_PLATFORM_WINDOWS)
-        // windows also needs SO_EXCLUSEIVEADDRUSE,
-        // see http://www.andy-pearce.com/blog/posts/2013/Feb/so_reuseaddr-on-windows/
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&enable, sizeof(enable));
-        enable = 1;
-        setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&enable, sizeof(enable));
-    #endif
+    if (reuse_open_port)
+    {
+		int enable = 1;
+
+		// set SO_REUSEADDR so binding doesn't fail when restarting the application
+        // (otherwise the same port can't be reused within TIME_WAIT)
+        // I'm not checking for errors because if this fails (unlikely) we might still
+        // be able to bind to the socket anyway
+        #ifdef RMT_PLATFORM_POSIX
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+        #elif defined(RMT_PLATFORM_WINDOWS)
+            // windows also needs SO_EXCLUSEIVEADDRUSE,
+            // see http://www.andy-pearce.com/blog/posts/2013/Feb/so_reuseaddr-on-windows/
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&enable, sizeof(enable));
+            enable = 1;
+            setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&enable, sizeof(enable));
+        #endif
+    }
 
     // Bind the socket to the incoming port
     sin.sin_family = AF_INET;
@@ -3153,12 +3157,12 @@ static void WebSocket_Destructor(WebSocket* web_socket)
 }
 
 
-static rmtError WebSocket_RunServer(WebSocket* web_socket, rmtU16 port, rmtBool limit_connections_to_localhost, enum WebSocketMode mode)
+static rmtError WebSocket_RunServer(WebSocket* web_socket, rmtU16 port, rmtBool reuse_open_port, rmtBool limit_connections_to_localhost, enum WebSocketMode mode)
 {
     // Create the server's listening socket
     assert(web_socket != NULL);
     web_socket->mode = mode;
-    return TCPSocket_RunServer(web_socket->tcp_socket, port, limit_connections_to_localhost);
+    return TCPSocket_RunServer(web_socket->tcp_socket, port, reuse_open_port, limit_connections_to_localhost);
 }
 
 
@@ -3637,6 +3641,8 @@ typedef struct
     rmtU32 last_ping_time;
 
     rmtU16 port;
+
+	rmtBool reuse_open_port;
     rmtBool limit_connections_to_localhost;
 
     // A dynamically-sized buffer used for binary-encoding messages and sending to the client
@@ -3648,19 +3654,19 @@ typedef struct
 } Server;
 
 
-static rmtError Server_CreateListenSocket(Server* server, rmtU16 port, rmtBool limit_connections_to_localhost)
+static rmtError Server_CreateListenSocket(Server* server, rmtU16 port, rmtBool reuse_open_port, rmtBool limit_connections_to_localhost)
 {
     rmtError error = RMT_ERROR_NONE;
 
     New_1(WebSocket, server->listen_socket, NULL);
     if (error == RMT_ERROR_NONE)
-        error = WebSocket_RunServer(server->listen_socket, port, limit_connections_to_localhost, WEBSOCKET_BINARY);
+        error = WebSocket_RunServer(server->listen_socket, port, reuse_open_port, limit_connections_to_localhost, WEBSOCKET_BINARY);
 
     return error;
 }
 
 
-static rmtError Server_Constructor(Server* server, rmtU16 port, rmtBool limit_connections_to_localhost)
+static rmtError Server_Constructor(Server* server, rmtU16 port, rmtBool reuse_open_port, rmtBool limit_connections_to_localhost)
 {
     rmtError error;
 
@@ -3669,6 +3675,7 @@ static rmtError Server_Constructor(Server* server, rmtU16 port, rmtBool limit_co
     server->client_socket = NULL;
     server->last_ping_time = 0;
     server->port = port;
+	server->reuse_open_port = reuse_open_port;
     server->limit_connections_to_localhost = limit_connections_to_localhost;
     server->bin_buf = NULL;
     server->receive_handler = NULL;
@@ -3680,7 +3687,7 @@ static rmtError Server_Constructor(Server* server, rmtU16 port, rmtBool limit_co
         return error;
 
     // Create the listening WebSocket
-    return Server_CreateListenSocket(server, port, limit_connections_to_localhost);
+    return Server_CreateListenSocket(server, port, reuse_open_port, limit_connections_to_localhost);
 }
 
 
@@ -3769,7 +3776,7 @@ static void Server_Update(Server* server)
 
     // Recreate the listening socket if it's been destroyed earlier
     if (server->listen_socket == NULL)
-        Server_CreateListenSocket(server, server->port, server->limit_connections_to_localhost);
+        Server_CreateListenSocket(server, server->port, server->reuse_open_port, server->limit_connections_to_localhost);
 
     if (server->listen_socket != NULL && server->client_socket == NULL)
     {
@@ -4254,7 +4261,7 @@ static void AddSampleTreeMessage(rmtMessageQueue* queue, Sample* sample, ObjectA
 typedef struct ThreadSampler
 {
     // Name to assign to the thread in the viewer
-    rmtS8 name[64];
+    rmtS8 name[256];
 
     // Store a unique sample tree for each type
     SampleTree* sample_trees[SampleType_Count];
@@ -4529,7 +4536,7 @@ static rmtError Remotery_SendLogTextMessage(Remotery* rmt, Message* message)
 static rmtError bin_SampleTree(Buffer* buffer, Msg_SampleTree* msg)
 {
     Sample* root_sample;
-    char thread_name[64];
+    char thread_name[256];
     rmtU32 digest_hash = 0, nb_samples = 0;
     rmtError error;
 
@@ -4542,7 +4549,7 @@ static rmtError bin_SampleTree(Buffer* buffer, Msg_SampleTree* msg)
 
     // Add any sample types as a thread name post-fix to ensure they get their own viewer
     thread_name[0] = 0;
-    strncat_s(thread_name, sizeof(thread_name), msg->thread_name, strnlen_s(msg->thread_name, 64));
+    strncat_s(thread_name, sizeof(thread_name), msg->thread_name, strnlen_s(msg->thread_name, 255));
     if (root_sample->type == SampleType_CUDA)
         strncat_s(thread_name, sizeof(thread_name), " (CUDA)", 7);
     if (root_sample->type == SampleType_D3D11)
@@ -4867,7 +4874,7 @@ static rmtError Remotery_Constructor(Remotery* rmt)
         return error;
 
     // Create the server
-    New_2(Server, rmt->server, g_Settings.port, g_Settings.limit_connections_to_localhost);
+    New_3(Server, rmt->server, g_Settings.port, g_Settings.reuse_open_port, g_Settings.limit_connections_to_localhost);
     if (error != RMT_ERROR_NONE)
         return error;
 
@@ -5048,6 +5055,7 @@ RMT_API rmtSettings* _rmt_Settings(void)
     if( g_SettingsInitialized == RMT_FALSE )
     {
         g_Settings.port = 0x4597;
+		g_Settings.reuse_open_port = RMT_FALSE;
         g_Settings.limit_connections_to_localhost = RMT_FALSE;
         g_Settings.msSleepBetweenServerUpdates = 10;
         g_Settings.messageQueueSizeInBytes = 128 * 1024;
@@ -5377,7 +5385,7 @@ static rmtBool rmtMessageQueue_IsEmpty(rmtMessageQueue* queue)
 typedef struct CUDASample
 {
     // IS-A inheritance relationship
-    Sample Sample;
+    Sample base;
 
     // Pair of events that wrap the sample
     CUevent event_start;
@@ -5483,8 +5491,8 @@ static rmtError CUDASample_Constructor(CUDASample* sample)
 
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
-    sample->Sample.type = SampleType_CUDA;
-    sample->Sample.size_bytes = sizeof(CUDASample);
+    sample->base.type = SampleType_CUDA;
+    sample->base.size_bytes = sizeof(CUDASample);
     sample->event_start = NULL;
     sample->event_end = NULL;
 
@@ -5632,9 +5640,9 @@ RMT_API void _rmt_EndCUDASample(void* stream)
     if (Remotery_GetThreadSampler(g_Remotery, &ts) == RMT_ERROR_NONE)
     {
         CUDASample* sample = (CUDASample*)ts->sample_trees[SampleType_CUDA]->current_parent;
-        if (sample->Sample.recurse_depth > 0)
+        if (sample->base.recurse_depth > 0)
         {
-            sample->Sample.recurse_depth--;
+            sample->base.recurse_depth--;
         }
         else
         {
@@ -6006,7 +6014,7 @@ static HRESULT D3D11Timestamp_GetData(D3D11Timestamp* stamp, ID3D11DeviceContext
 typedef struct D3D11Sample
 {
     // IS-A inheritance relationship
-    Sample Sample;
+    Sample base;
 
     D3D11Timestamp* timestamp;
 
@@ -6021,8 +6029,8 @@ static rmtError D3D11Sample_Constructor(D3D11Sample* sample)
 
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
-    sample->Sample.type = SampleType_D3D11;
-    sample->Sample.size_bytes = sizeof(D3D11Sample);
+    sample->base.type = SampleType_D3D11;
+    sample->base.size_bytes = sizeof(D3D11Sample);
     New_0(D3D11Timestamp, sample->timestamp);
 
     return RMT_ERROR_NONE;
@@ -6234,9 +6242,9 @@ RMT_API void _rmt_EndD3D11Sample(void)
     {
         // Close the timestamp
         D3D11Sample* d3d_sample = (D3D11Sample*)ts->sample_trees[SampleType_D3D11]->current_parent;
-        if (d3d_sample->Sample.recurse_depth > 0)
+        if (d3d_sample->base.recurse_depth > 0)
         {
-            d3d_sample->Sample.recurse_depth--;
+            d3d_sample->base.recurse_depth--;
         }
         else
         {
@@ -6503,7 +6511,7 @@ typedef struct OpenGLTimestamp
 
 static rmtError OpenGLTimestamp_Constructor(OpenGLTimestamp* stamp)
 {
-    int error;
+    GLenum error;
 
     assert(stamp != NULL);
 
@@ -6512,6 +6520,10 @@ static rmtError OpenGLTimestamp_Constructor(OpenGLTimestamp* stamp)
     // Set defaults
     stamp->queries[0] = stamp->queries[1] = 0;
     stamp->cpu_timestamp = 0;
+
+    // Empty the error queue before using it for glGenQueries
+    while ((error = rmtglGetError()) != GL_NO_ERROR)
+        ;
 
     // Create start/end timestamp queries
     assert(g_Remotery != NULL);
@@ -6530,12 +6542,7 @@ static void OpenGLTimestamp_Destructor(OpenGLTimestamp* stamp)
 
     // Destroy queries
     if (stamp->queries[0] != 0)
-    {
-        int error;
         rmtglDeleteQueries(2, stamp->queries);
-        error = rmtglGetError();
-        assert(error == GL_NO_ERROR);
-    }
 }
 
 
@@ -6563,7 +6570,6 @@ static rmtBool OpenGLTimestamp_GetData(OpenGLTimestamp* stamp, rmtU64* out_start
 {
     GLuint64 start = 0, end = 0;
     GLint startAvailable = 0, endAvailable = 0;
-    int error;
 
     assert(g_Remotery != NULL);
 
@@ -6573,22 +6579,14 @@ static rmtBool OpenGLTimestamp_GetData(OpenGLTimestamp* stamp, rmtU64* out_start
     // Check to see if all queries are ready
     // If any fail to arrive, wait until later
     rmtglGetQueryObjectiv(stamp->queries[0], GL_QUERY_RESULT_AVAILABLE, &startAvailable);
-    error = rmtglGetError();
-    assert(error == GL_NO_ERROR);
     if (!startAvailable)
         return RMT_FALSE;
     rmtglGetQueryObjectiv(stamp->queries[1], GL_QUERY_RESULT_AVAILABLE, &endAvailable);
-    error = rmtglGetError();
-    assert(error == GL_NO_ERROR);
     if (!endAvailable)
         return RMT_FALSE;
 
     rmtglGetQueryObjectui64v(stamp->queries[0], GL_QUERY_RESULT, &start);
-    error = rmtglGetError();
-    assert(error == GL_NO_ERROR);
     rmtglGetQueryObjectui64v(stamp->queries[1], GL_QUERY_RESULT, &end);
-    error = rmtglGetError();
-    assert(error == GL_NO_ERROR);
 
     // Mark the first timestamp. We may resync if we detect the GPU timestamp is in the
     // past (i.e. happened before the CPU command) since it should be impossible.
@@ -6607,7 +6605,7 @@ static rmtBool OpenGLTimestamp_GetData(OpenGLTimestamp* stamp, rmtU64* out_start
 typedef struct OpenGLSample
 {
     // IS-A inheritance relationship
-    Sample Sample;
+    Sample base;
 
     OpenGLTimestamp* timestamp;
 
@@ -6622,8 +6620,8 @@ static rmtError OpenGLSample_Constructor(OpenGLSample* sample)
 
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
-    sample->Sample.type = SampleType_OpenGL;
-    sample->Sample.size_bytes = sizeof(OpenGLSample);
+    sample->base.type = SampleType_OpenGL;
+    sample->base.size_bytes = sizeof(OpenGLSample);
 	New_0(OpenGLTimestamp, sample->timestamp);
 
     return RMT_ERROR_NONE;
@@ -6647,6 +6645,8 @@ RMT_API void _rmt_BindOpenGL()
             opengl->dll_handle = rmtLoadLibrary("opengl32.dll");
         #elif defined (RMT_PLATFORM_MACOS)
             opengl->dll_handle = rmtLoadLibrary("/System/Library/Frameworks/OpenGL.framework/Versions/Current/OpenGL");
+        #elif defined (RMT_PLATFORM_LINUX)
+            opengl->dll_handle = rmtLoadLibrary("libGL.so");
         #endif
 
         opengl->__glGetError = (PFNGLGETERRORPROC)rmtGetProcAddress(opengl->dll_handle, "glGetError");
@@ -6814,9 +6814,9 @@ RMT_API void _rmt_EndOpenGLSample(void)
     {
         // Close the timestamp
         OpenGLSample* ogl_sample = (OpenGLSample*)ts->sample_trees[SampleType_OpenGL]->current_parent;
-        if (ogl_sample->Sample.recurse_depth > 0)
+        if (ogl_sample->base.recurse_depth > 0)
         {
-            ogl_sample->Sample.recurse_depth--;
+            ogl_sample->base.recurse_depth--;
         }
         else
         {
@@ -6967,7 +6967,7 @@ static rmtBool MetalTimestamp_GetData(MetalTimestamp* stamp, rmtU64* out_start, 
 typedef struct MetalSample
 {
     // IS-A inheritance relationship
-    Sample Sample;
+    Sample base;
 
     MetalTimestamp* timestamp;
 
@@ -6982,8 +6982,8 @@ static rmtError MetalSample_Constructor(MetalSample* sample)
 
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
-    sample->Sample.type = SampleType_Metal;
-    sample->Sample.size_bytes = sizeof(MetalSample);
+    sample->base.type = SampleType_Metal;
+    sample->base.size_bytes = sizeof(MetalSample);
     New_0(MetalTimestamp, sample->timestamp);
 
     return RMT_ERROR_NONE;
@@ -7130,9 +7130,9 @@ RMT_API void _rmt_EndMetalSample(void)
     {
         // Close the timestamp
         MetalSample* metal_sample = (MetalSample*)ts->sample_trees[SampleType_Metal]->current_parent;
-        if (metal_sample->Sample.recurse_depth > 0)
+        if (metal_sample->base.recurse_depth > 0)
         {
-            metal_sample->Sample.recurse_depth--;
+            metal_sample->base.recurse_depth--;
         }
         else
         {
